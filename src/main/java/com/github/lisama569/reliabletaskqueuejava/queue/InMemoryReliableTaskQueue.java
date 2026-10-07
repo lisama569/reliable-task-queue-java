@@ -31,6 +31,7 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
 
     private final int maxAttempts;
     private final long leaseMillis;
+    private final int maxCapacity;
     private final RetryPolicy retryPolicy;
     private final TaskQueueStore store;
     private final Clock clock;
@@ -43,11 +44,13 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
 
     public InMemoryReliableTaskQueue(int maxAttempts,
                                      long leaseMillis,
+                                     int maxCapacity,
                                      RetryPolicy retryPolicy,
                                      TaskQueueStore store,
                                      Clock clock) {
         this.maxAttempts = maxAttempts;
         this.leaseMillis = leaseMillis;
+        this.maxCapacity = maxCapacity;
         this.retryPolicy = retryPolicy;
         this.store = store;
         this.clock = clock;
@@ -110,6 +113,12 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
                 log.info("enqueue key='{}' -> {} (offset={}, currentState={}): duplicate submit does not execute again",
                         idempotencyKey, status, existing.getOffset(), existing.getState());
                 return new EnqueueResult(status, existing);
+            }
+            if (maxCapacity > 0 && inFlightCountLocked() >= maxCapacity) {
+                log.info("enqueue key='{}' -> REJECTED_CAPACITY: inFlight={} >= maxCapacity={}, "
+                                + "new task explicitly rejected (not silently dropped), retry later",
+                        idempotencyKey, inFlightCountLocked(), maxCapacity);
+                return new EnqueueResult(EnqueueStatus.REJECTED_CAPACITY, null);
             }
             long now = clock.millis();
             TaskRecord t = new TaskRecord();
@@ -341,6 +350,132 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
     @Override
     public int maxAttempts() {
         return maxAttempts;
+    }
+
+    @Override
+    public int maxCapacity() {
+        return maxCapacity;
+    }
+
+    @Override
+    public int inFlightCount() {
+        lock.lock();
+        try {
+            return inFlightCountLocked();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private int inFlightCountLocked() {
+        int count = 0;
+        for (TaskRecord t : tasks) {
+            if (t.getState() == TaskState.PENDING || t.getState() == TaskState.RUNNING) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Override
+    public AckOutcome renew(long offset, String ownerToken) {
+        lock.lock();
+        try {
+            TaskRecord t = taskAt(offset);
+            if (t == null) {
+                return new AckOutcome(AckStatus.NOT_RUNNING, false);
+            }
+            if (t.getState() == TaskState.SUCCEEDED) {
+                return new AckOutcome(AckStatus.ALREADY_ACKED, false);
+            }
+            if (t.getState() == TaskState.DEAD) {
+                return new AckOutcome(AckStatus.DEAD, false);
+            }
+            if (t.getState() == TaskState.PENDING) {
+                return new AckOutcome(AckStatus.NOT_RUNNING, false);
+            }
+            long now = clock.millis();
+            if (!ownerToken.equals(t.getOwnerToken()) || now > t.getLeaseExpireAtMillis()) {
+                log.info("renew rejected: key='{}' offset={} owner='{}' currentOwner='{}' leaseExpireAt={} -> LEASE_EXPIRED",
+                        t.getIdempotencyKey(), offset, ownerToken, t.getOwnerToken(), t.getLeaseExpireAtMillis());
+                return new AckOutcome(AckStatus.LEASE_EXPIRED, false);
+            }
+            long before = t.getLeaseExpireAtMillis();
+            t.setLeaseExpireAtMillis(now + leaseMillis);
+            persistLocked();
+            log.info("renew: key='{}' offset={} owner='{}' leaseExpireAt {} -> {} (state stays RUNNING)",
+                    t.getIdempotencyKey(), offset, ownerToken, before, t.getLeaseExpireAtMillis());
+            return new AckOutcome(AckStatus.APPLIED, false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public AckOutcome abandon(long offset, String ownerToken) {
+        lock.lock();
+        try {
+            TaskRecord t = taskAt(offset);
+            if (t == null) {
+                return new AckOutcome(AckStatus.NOT_RUNNING, false);
+            }
+            if (t.getState() == TaskState.SUCCEEDED) {
+                return new AckOutcome(AckStatus.ALREADY_ACKED, false);
+            }
+            if (t.getState() == TaskState.DEAD) {
+                return new AckOutcome(AckStatus.DEAD, false);
+            }
+            if (t.getState() == TaskState.PENDING) {
+                return new AckOutcome(AckStatus.NOT_RUNNING, false);
+            }
+            if (!ownerToken.equals(t.getOwnerToken()) || clock.millis() > t.getLeaseExpireAtMillis()) {
+                log.info("abandon rejected: key='{}' offset={} owner='{}' currentOwner='{}' -> LEASE_EXPIRED",
+                        t.getIdempotencyKey(), offset, ownerToken, t.getOwnerToken());
+                return new AckOutcome(AckStatus.LEASE_EXPIRED, false);
+            }
+            releaseLocked(t, clock.millis());
+            persistLocked();
+            log.info("transition key='{}' offset={} RUNNING -> PENDING (abandoned by owner='{}', immediately visible, attempts={}/{})",
+                    t.getIdempotencyKey(), offset, ownerToken, t.getAttempts(), t.getMaxAttempts());
+            return new AckOutcome(AckStatus.APPLIED, false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public int releaseAll(String ownerToken) {
+        if (ownerToken == null || ownerToken.isBlank()) {
+            throw new IllegalArgumentException("ownerToken must not be blank");
+        }
+        lock.lock();
+        try {
+            long now = clock.millis();
+            int released = 0;
+            for (TaskRecord t : tasks) {
+                if (t.getState() == TaskState.RUNNING && ownerToken.equals(t.getOwnerToken())) {
+                    releaseLocked(t, now);
+                    released++;
+                    log.info("transition key='{}' offset={} RUNNING -> PENDING (released on graceful shutdown of owner='{}')",
+                            t.getIdempotencyKey(), t.getOffset(), ownerToken);
+                }
+            }
+            if (released > 0) {
+                persistLocked();
+            }
+            log.info("releaseAll: owner='{}' released {} task(s)", ownerToken, released);
+            return released;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** 释放占用：回到 PENDING 并立即可见；不清 attempts、不写失败原因（主动放弃不等于失败）。 */
+    private void releaseLocked(TaskRecord t, long now) {
+        t.setState(TaskState.PENDING);
+        t.setOwnerToken(null);
+        t.setLeaseExpireAtMillis(0L);
+        t.setNextVisibleAtMillis(now);
     }
 
     private TaskRecord taskAt(long offset) {

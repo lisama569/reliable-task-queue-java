@@ -2,6 +2,7 @@ package com.github.lisama569.reliabletaskqueuejava.web;
 
 import com.github.lisama569.reliabletaskqueuejava.queue.AckOutcome;
 import com.github.lisama569.reliabletaskqueuejava.queue.EnqueueResult;
+import com.github.lisama569.reliabletaskqueuejava.queue.EnqueueStatus;
 import com.github.lisama569.reliabletaskqueuejava.queue.OffsetRollbackException;
 import com.github.lisama569.reliabletaskqueuejava.queue.TaskQueue;
 import com.github.lisama569.reliabletaskqueuejava.queue.TaskRecord;
@@ -32,12 +33,16 @@ public class TaskQueueController {
         this.queue = queue;
     }
 
-    /** 幂等提交：body 为 {"key":"...", "payload":"..."}。 */
+    /** 幂等提交：body 为 {"key":"...", "payload":"..."}；容量满时返回 429 与确定结果。 */
     @PostMapping
-    public EnqueueResult enqueue(@RequestBody Map<String, String> body) {
+    public ResponseEntity<EnqueueResult> enqueue(@RequestBody Map<String, String> body) {
         String key = body.get("key");
         String payload = body.get("payload");
-        return queue.enqueue(key, payload);
+        EnqueueResult result = queue.enqueue(key, payload);
+        if (result.status() == EnqueueStatus.REJECTED_CAPACITY) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(result);
+        }
+        return ResponseEntity.ok(result);
     }
 
     /** 拉取并占用一个任务（租约）。无任务时返回 204。 */
@@ -59,6 +64,24 @@ public class TaskQueueController {
                            @RequestParam String owner,
                            @RequestParam(required = false) String reason) {
         return queue.nack(offset, owner, reason);
+    }
+
+    /** 续期（心跳）：刷新租约，仅当前有效占用者可用。 */
+    @PostMapping("/{offset}/renew")
+    public AckOutcome renew(@PathVariable long offset, @RequestParam String owner) {
+        return queue.renew(offset, owner);
+    }
+
+    /** 主动放弃：任务立即回到待投递，可被其他消费者领取。 */
+    @PostMapping("/{offset}/abandon")
+    public AckOutcome abandon(@PathVariable long offset, @RequestParam String owner) {
+        return queue.abandon(offset, owner);
+    }
+
+    /** 优雅退出：释放该消费者占用的全部任务，返回释放数量。 */
+    @PostMapping("/release")
+    public Map<String, Integer> releaseAll(@RequestParam String owner) {
+        return Map.of("released", queue.releaseAll(owner));
     }
 
     @GetMapping("/{offset}")

@@ -42,6 +42,26 @@ public interface TaskQueue {
      */
     AckOutcome nack(long offset, String ownerToken, String reason);
 
+    /**
+     * 续期（心跳）：长任务处理过程中刷新租约到期时间，避免被当成失联重新投递。
+     * 仅当前持有有效租约的占用者可续期；租约已过期、已被他人接手或任务已结束时
+     * 续期被拒绝，此后原占用者的 ack/nack 同样会被拒绝。
+     */
+    AckOutcome renew(long offset, String ownerToken);
+
+    /**
+     * 主动放弃：消费者放弃当前占用的任务，任务立即回到 PENDING 并对所有消费者可见，
+     * 不消耗额外重试额度、不记录失败原因；放弃后原占用者的 ack/nack 一律被拒绝。
+     */
+    AckOutcome abandon(long offset, String ownerToken);
+
+    /**
+     * 优雅退出：释放该消费者当前占用的全部任务，使其立即可被其他消费者领取。
+     *
+     * @return 实际释放的任务数
+     */
+    int releaseAll(String ownerToken);
+
     /** 位点：首个未被成功确认的任务序号；所有序号小于该值的任务均已确认成功。 */
     long committedOffset();
 
@@ -62,4 +82,10 @@ public interface TaskQueue {
 
     /** 当前最大重试次数（含首次投递）。 */
     int maxAttempts();
+
+    /** 队列容量上限（在途任务数）；{@code <= 0} 表示不限容量。 */
+    int maxCapacity();
+
+    /** 当前在途任务数（PENDING + RUNNING），用于背压判断与观测。 */
+    int inFlightCount();
 }

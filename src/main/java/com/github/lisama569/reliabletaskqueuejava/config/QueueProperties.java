@@ -23,6 +23,9 @@ public class QueueProperties {
     /** 退避上限。 */
     private long retryMaxMillis = 60_000L;
 
+    /** 队列容量上限（在途任务数，PENDING+RUNNING）；<=0 表示不限容量。 */
+    private int maxCapacity = 0;
+
     public String getStorePath() {
         return storePath;
     }
@@ -61,5 +64,13 @@ public class QueueProperties {
 
     public void setRetryMaxMillis(long retryMaxMillis) {
         this.retryMaxMillis = retryMaxMillis;
+    }
+
+    public int getMaxCapacity() {
+        return maxCapacity;
+    }
+
+    public void setMaxCapacity(int maxCapacity) {
+        this.maxCapacity = maxCapacity;
     }
 }

@@ -15,5 +15,12 @@ public enum EnqueueStatus {
     ALREADY_SUCCEEDED,
 
     /** 幂等键对应的任务此前已重试耗尽进入死信；返回原任务，不会再次执行。 */
-    ALREADY_DEAD
+    ALREADY_DEAD,
+
+    /**
+     * 队列已达到容量上限（在途任务数），新任务被明确拒绝：返回结果中不含任务，
+     * 任务不会被静默丢弃，调用方可据此稍后重试或告警。
+     * 幂等键已存在的重复提交不受容量限制，仍返回原有的幂等结果。
+     */
+    REJECTED_CAPACITY
 }

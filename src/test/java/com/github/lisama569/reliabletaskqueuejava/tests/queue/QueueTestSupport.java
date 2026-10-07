@@ -19,11 +19,21 @@ final class QueueTestSupport {
                                               long leaseMillis,
                                               long retryBaseMillis,
                                               long retryMaxMillis) {
+        return newQueue(snapshot, clock, maxAttempts, leaseMillis, 0, retryBaseMillis, retryMaxMillis);
+    }
+
+    static InMemoryReliableTaskQueue newQueue(Path snapshot,
+                                              TestClock clock,
+                                              int maxAttempts,
+                                              long leaseMillis,
+                                              int maxCapacity,
+                                              long retryBaseMillis,
+                                              long retryMaxMillis) {
         JsonFileTaskQueueStore store =
                 new JsonFileTaskQueueStore(snapshot, new ObjectMapper());
         RetryPolicy retryPolicy = new RetryPolicy(retryBaseMillis, retryMaxMillis);
         InMemoryReliableTaskQueue queue =
-                new InMemoryReliableTaskQueue(maxAttempts, leaseMillis, retryPolicy, store, clock);
+                new InMemoryReliableTaskQueue(maxAttempts, leaseMillis, maxCapacity, retryPolicy, store, clock);
         queue.recover();
         return queue;
     }
