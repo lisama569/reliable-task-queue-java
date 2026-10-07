@@ -31,6 +31,7 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
 
     private final int maxAttempts;
     private final long leaseMillis;
+    private final int capacity;
     private final RetryPolicy retryPolicy;
     private final TaskQueueStore store;
     private final Clock clock;
@@ -46,8 +47,18 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
                                      RetryPolicy retryPolicy,
                                      TaskQueueStore store,
                                      Clock clock) {
+        this(maxAttempts, leaseMillis, 0, retryPolicy, store, clock);
+    }
+
+    public InMemoryReliableTaskQueue(int maxAttempts,
+                                     long leaseMillis,
+                                     int capacity,
+                                     RetryPolicy retryPolicy,
+                                     TaskQueueStore store,
+                                     Clock clock) {
         this.maxAttempts = maxAttempts;
         this.leaseMillis = leaseMillis;
+        this.capacity = capacity;
         this.retryPolicy = retryPolicy;
         this.store = store;
         this.clock = clock;
@@ -76,11 +87,12 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
                     t.setOwnerToken(null);
                     t.setLeaseExpireAtMillis(0L);
                     t.setNextVisibleAtMillis(clock.millis());
-                    log.info("recover: key='{}' offset={} RUNNING -> PENDING (lease invalidated by restart)",
+                    t.setPendingReason(PendingReason.LEASE_RECOVERED);
+                    log.info("recover: key='{}' offset={} RUNNING -> PENDING reason=LEASE_RECOVERED (lease invalidated by restart)",
                             t.getIdempotencyKey(), t.getOffset());
                 } else {
-                    log.info("recover: key='{}' offset={} restored as {}",
-                            t.getIdempotencyKey(), t.getOffset(), t.getState());
+                    log.info("recover: key='{}' offset={} restored as {} pendingReason={}",
+                            t.getIdempotencyKey(), t.getOffset(), t.getState(), t.getPendingReason());
                 }
             }
             nextOffset = maxOffset + 1;
@@ -111,6 +123,13 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
                         idempotencyKey, status, existing.getOffset(), existing.getState());
                 return new EnqueueResult(status, existing);
             }
+            // 容量背压：幂等检查优先——重复提交（含已完成/已死信）走到上面直接返回，
+            // 绝不额外占用容量，也不会因容量限制改变其幂等结果。
+            if (capacity > 0 && tasks.size() >= capacity) {
+                log.info("enqueue key='{}' -> QUEUE_FULL currentSize={} capacity={} (backpressure: task retained nowhere, caller should retry later)",
+                        idempotencyKey, tasks.size(), capacity);
+                return new EnqueueResult(EnqueueStatus.QUEUE_FULL, null);
+            }
             long now = clock.millis();
             TaskRecord t = new TaskRecord();
             t.setOffset(nextOffset++);
@@ -121,6 +140,7 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
             t.setMaxAttempts(maxAttempts);
             t.setEnqueueAtMillis(now);
             t.setNextVisibleAtMillis(now);
+            t.setPendingReason(PendingReason.ENQUEUED);
             tasks.add(t);
             byKey.put(idempotencyKey, t);
             persistLocked();
@@ -146,6 +166,7 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
                 if (t.getState() == TaskState.RUNNING && t.getLeaseExpireAtMillis() <= now) {
                     log.info("lease expired: key='{}' offset={} previousOwner='{}' -> redelivered to '{}'",
                             t.getIdempotencyKey(), t.getOffset(), t.getOwnerToken(), ownerToken);
+                    t.setPendingReason(PendingReason.LEASE_RECOVERED);
                     return claimLocked(t, ownerToken, now, true);
                 }
             }
@@ -156,14 +177,17 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
     }
 
     private TaskRecord claimLocked(TaskRecord t, String ownerToken, long now, boolean redelivery) {
+        PendingReason previousPendingReason = t.getPendingReason();
         t.setState(TaskState.RUNNING);
         t.setOwnerToken(ownerToken);
         t.setLeaseExpireAtMillis(now + leaseMillis);
         t.setAttempts(t.getAttempts() + 1);
+        t.setPendingReason(null);
         persistLocked();
-        log.info("transition key='{}' offset={} -> RUNNING owner='{}' attempt={}/{} redelivery={}",
+        log.info("transition key='{}' offset={} -> RUNNING owner='{}' attempt={}/{} redelivery={} pendingReason={}",
                 t.getIdempotencyKey(), t.getOffset(), ownerToken,
-                t.getAttempts(), t.getMaxAttempts(), redelivery);
+                t.getAttempts(), t.getMaxAttempts(), redelivery,
+                redelivery ? previousPendingReason : null);
         return t;
     }
 
@@ -232,6 +256,7 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
             if (t.getAttempts() >= t.getMaxAttempts()) {
                 t.setState(TaskState.DEAD);
                 t.setFailureReason(reason);
+                t.setPendingReason(null);
                 t.setCompletedAtMillis(clock.millis());
                 persistLocked();
                 log.info("transition key='{}' offset={} RUNNING -> DEAD attempts={}/{} reason='{}' (retained in dead-letter queue)",
@@ -241,10 +266,97 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
             long backoff = retryPolicy.backoffMillis(t.getAttempts());
             t.setState(TaskState.PENDING);
             t.setFailureReason(reason);
+            t.setPendingReason(PendingReason.RETRY_BACKOFF);
             t.setNextVisibleAtMillis(clock.millis() + backoff);
             persistLocked();
             log.info("transition key='{}' offset={} RUNNING -> PENDING retryScheduledInMs={} attempts={}/{} lastReason='{}'",
                     t.getIdempotencyKey(), offset, backoff, t.getAttempts(), t.getMaxAttempts(), reason);
+            return new AckOutcome(AckStatus.APPLIED, false);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public RenewOutcome renew(long offset, String ownerToken) {
+        if (ownerToken == null || ownerToken.isBlank()) {
+            throw new IllegalArgumentException("ownerToken must not be blank");
+        }
+        lock.lock();
+        try {
+            TaskRecord t = taskAt(offset);
+            if (t == null) {
+                return new RenewOutcome(RenewStatus.NOT_RUNNING, 0L);
+            }
+            if (t.getState() == TaskState.SUCCEEDED) {
+                return new RenewOutcome(RenewStatus.ALREADY_ACKED, 0L);
+            }
+            if (t.getState() == TaskState.DEAD) {
+                return new RenewOutcome(RenewStatus.DEAD, 0L);
+            }
+            if (t.getState() == TaskState.PENDING) {
+                log.info("renew rejected: key='{}' offset={} owner='{}' -> NOT_RUNNING",
+                        t.getIdempotencyKey(), offset, ownerToken);
+                return new RenewOutcome(RenewStatus.NOT_RUNNING, 0L);
+            }
+            long now = clock.millis();
+            // 仅当前有效占用者（令牌匹配且租约未过期、未被他人接手）可续期
+            if (!ownerToken.equals(t.getOwnerToken()) || now > t.getLeaseExpireAtMillis()) {
+                log.info("renew rejected: key='{}' offset={} owner='{}' currentOwner='{}' leaseExpireAt={} now={} -> LEASE_EXPIRED",
+                        t.getIdempotencyKey(), offset, ownerToken, t.getOwnerToken(),
+                        t.getLeaseExpireAtMillis(), now);
+                return new RenewOutcome(RenewStatus.LEASE_EXPIRED, 0L);
+            }
+            long newExpireAt = now + leaseMillis;
+            t.setLeaseExpireAtMillis(newExpireAt);
+            persistLocked();
+            log.info("renew key='{}' offset={} owner='{}' leaseExpireAt={} -> {} (heartbeat extended)",
+                    t.getIdempotencyKey(), offset, ownerToken, newExpireAt - leaseMillis, newExpireAt);
+            return new RenewOutcome(RenewStatus.RENEWED, newExpireAt);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public AckOutcome abandon(long offset, String ownerToken, String reason) {
+        if (ownerToken == null || ownerToken.isBlank()) {
+            throw new IllegalArgumentException("ownerToken must not be blank");
+        }
+        lock.lock();
+        try {
+            TaskRecord t = taskAt(offset);
+            if (t == null) {
+                return new AckOutcome(AckStatus.NOT_RUNNING, false);
+            }
+            if (t.getState() == TaskState.SUCCEEDED) {
+                return new AckOutcome(AckStatus.ALREADY_ACKED, false);
+            }
+            if (t.getState() == TaskState.DEAD) {
+                return new AckOutcome(AckStatus.DEAD, false);
+            }
+            if (t.getState() == TaskState.PENDING) {
+                log.info("abandon rejected: key='{}' offset={} owner='{}' -> NOT_RUNNING",
+                        t.getIdempotencyKey(), offset, ownerToken);
+                return new AckOutcome(AckStatus.NOT_RUNNING, false);
+            }
+            // 仅当前有效占用者可放弃；租约已过期/已被他人接手则拒绝，
+            // 与 ack/nack 使用完全相同的有效性判定，放弃后不可能再确认
+            if (!ownerToken.equals(t.getOwnerToken()) || clock.millis() > t.getLeaseExpireAtMillis()) {
+                log.info("abandon rejected: key='{}' offset={} owner='{}' currentOwner='{}' -> LEASE_EXPIRED",
+                        t.getIdempotencyKey(), offset, ownerToken, t.getOwnerToken());
+                return new AckOutcome(AckStatus.LEASE_EXPIRED, false);
+            }
+            long now = clock.millis();
+            t.setState(TaskState.PENDING);
+            t.setOwnerToken(null);
+            t.setLeaseExpireAtMillis(0L);
+            t.setNextVisibleAtMillis(now);
+            t.setPendingReason(PendingReason.ABANDONED);
+            persistLocked();
+            log.info("transition key='{}' offset={} RUNNING -> PENDING reason=ABANDONED owner='{}' lastReason='{}' "
+                            + "(immediately reclaimable by other consumers)",
+                    t.getIdempotencyKey(), offset, ownerToken, reason);
             return new AckOutcome(AckStatus.APPLIED, false);
         } finally {
             lock.unlock();
@@ -341,6 +453,21 @@ public class InMemoryReliableTaskQueue implements TaskQueue {
     @Override
     public int maxAttempts() {
         return maxAttempts;
+    }
+
+    @Override
+    public int capacity() {
+        return capacity;
+    }
+
+    @Override
+    public int currentSize() {
+        lock.lock();
+        try {
+            return tasks.size();
+        } finally {
+            lock.unlock();
+        }
     }
 
     private TaskRecord taskAt(long offset) {

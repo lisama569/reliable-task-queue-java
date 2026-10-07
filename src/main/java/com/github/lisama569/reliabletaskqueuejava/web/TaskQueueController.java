@@ -2,7 +2,9 @@ package com.github.lisama569.reliabletaskqueuejava.web;
 
 import com.github.lisama569.reliabletaskqueuejava.queue.AckOutcome;
 import com.github.lisama569.reliabletaskqueuejava.queue.EnqueueResult;
+import com.github.lisama569.reliabletaskqueuejava.queue.EnqueueStatus;
 import com.github.lisama569.reliabletaskqueuejava.queue.OffsetRollbackException;
+import com.github.lisama569.reliabletaskqueuejava.queue.RenewOutcome;
 import com.github.lisama569.reliabletaskqueuejava.queue.TaskQueue;
 import com.github.lisama569.reliabletaskqueuejava.queue.TaskRecord;
 import org.springframework.http.HttpStatus;
@@ -32,12 +34,19 @@ public class TaskQueueController {
         this.queue = queue;
     }
 
-    /** 幂等提交：body 为 {"key":"...", "payload":"..."}。 */
+    /**
+     * 幂等提交：body 为 {"key":"...", "payload":"..."}。
+     * 达到容量上限时返回 429 与 {@link EnqueueStatus#QUEUE_FULL}（背压，任务不会被静默丢弃）。
+     */
     @PostMapping
-    public EnqueueResult enqueue(@RequestBody Map<String, String> body) {
+    public ResponseEntity<EnqueueResult> enqueue(@RequestBody Map<String, String> body) {
         String key = body.get("key");
         String payload = body.get("payload");
-        return queue.enqueue(key, payload);
+        EnqueueResult result = queue.enqueue(key, payload);
+        if (result.status() == EnqueueStatus.QUEUE_FULL) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(result);
+        }
+        return ResponseEntity.ok(result);
     }
 
     /** 拉取并占用一个任务（租约）。无任务时返回 204。 */
@@ -61,6 +70,20 @@ public class TaskQueueController {
         return queue.nack(offset, owner, reason);
     }
 
+    /** 租约续期（长任务心跳）：仅当前有效占用者可续，失败后原占用者也无法再确认。 */
+    @PostMapping("/{offset}/renew")
+    public RenewOutcome renew(@PathVariable long offset, @RequestParam String owner) {
+        return queue.renew(offset, owner);
+    }
+
+    /** 主动放弃占用：任务立即重新可领取；放弃后原占用者的确认会被拒绝。 */
+    @PostMapping("/{offset}/abandon")
+    public AckOutcome abandon(@PathVariable long offset,
+                              @RequestParam String owner,
+                              @RequestParam(required = false) String reason) {
+        return queue.abandon(offset, owner, reason);
+    }
+
     @GetMapping("/{offset}")
     public TaskRecord get(@PathVariable long offset) {
         return queue.get(offset);
@@ -79,6 +102,12 @@ public class TaskQueueController {
     @GetMapping("/committed-offset")
     public Map<String, Long> committedOffset() {
         return Map.of("committedOffset", queue.committedOffset());
+    }
+
+    /** 容量与当前占用（capacity&lt;=0 表示不限制）。 */
+    @GetMapping("/capacity")
+    public Map<String, Integer> capacity() {
+        return Map.of("capacity", queue.capacity(), "currentSize", queue.currentSize());
     }
 
     /**

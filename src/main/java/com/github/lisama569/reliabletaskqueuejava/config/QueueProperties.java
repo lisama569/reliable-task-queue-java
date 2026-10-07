@@ -23,6 +23,9 @@ public class QueueProperties {
     /** 退避上限。 */
     private long retryMaxMillis = 60_000L;
 
+    /** 队列任务数量上限（背压）；&lt;=0 表示不限制。重复幂等提交不额外占用容量。 */
+    private int maxTasks = 0;
+
     public String getStorePath() {
         return storePath;
     }
@@ -61,5 +64,13 @@ public class QueueProperties {
 
     public void setRetryMaxMillis(long retryMaxMillis) {
         this.retryMaxMillis = retryMaxMillis;
+    }
+
+    public int getMaxTasks() {
+        return maxTasks;
+    }
+
+    public void setMaxTasks(int maxTasks) {
+        this.maxTasks = maxTasks;
     }
 }

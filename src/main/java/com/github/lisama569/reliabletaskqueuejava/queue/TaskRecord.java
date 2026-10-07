@@ -17,6 +17,7 @@ public class TaskRecord {
     private long nextVisibleAtMillis;
     private long completedAtMillis;
     private String failureReason;
+    private PendingReason pendingReason;
 
     public TaskRecord() {
     }
@@ -117,6 +118,14 @@ public class TaskRecord {
         this.failureReason = failureReason;
     }
 
+    public PendingReason getPendingReason() {
+        return pendingReason;
+    }
+
+    public void setPendingReason(PendingReason pendingReason) {
+        this.pendingReason = pendingReason;
+    }
+
     @Override
     public String toString() {
         return "TaskRecord{offset=" + offset
@@ -124,6 +133,7 @@ public class TaskRecord {
                 + ", state=" + state
                 + ", attempts=" + attempts + '/' + maxAttempts
                 + ", owner='" + ownerToken + '\''
+                + ", pendingReason=" + pendingReason
                 + ", failureReason='" + failureReason + '\''
                 + '}';
     }

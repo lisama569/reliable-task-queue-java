@@ -41,6 +41,7 @@ public class TaskQueueAutoConfiguration {
         InMemoryReliableTaskQueue queue = new InMemoryReliableTaskQueue(
                 properties.getMaxAttempts(),
                 properties.getLeaseMillis(),
+                properties.getMaxTasks(),
                 retryPolicy,
                 store,
                 taskQueueClock);

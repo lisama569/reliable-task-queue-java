@@ -15,5 +15,8 @@ public enum EnqueueStatus {
     ALREADY_SUCCEEDED,
 
     /** 幂等键对应的任务此前已重试耗尽进入死信；返回原任务，不会再次执行。 */
-    ALREADY_DEAD
+    ALREADY_DEAD,
+
+    /** 队列已达容量上限（背压）：任务未被接收也绝不会被静默丢弃，调用方应稍后重试。 */
+    QUEUE_FULL
 }
